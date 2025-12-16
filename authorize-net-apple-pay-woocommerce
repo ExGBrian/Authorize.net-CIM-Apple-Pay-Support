@@ -1,0 +1,637 @@
+<?php
+/**
+ * Plugin Name: Authorize.Net Apple Pay Universal
+ * Description: Adds universal Apple Pay button with WooCommerce shipping integration
+ * Version: 1.3.0
+ * Author: Brian Paknoosh
+ */
+
+if (!defined('ABSPATH'))
+	exit;
+
+class AuthNet_Apple_Pay_Universal
+{
+
+	public function __construct()
+	{
+		add_filter('wc_payment_gateway_authorize_net_cim_activate_apple_pay', '__return_true', 999);
+		add_action('plugins_loaded', array($this, 'init'), 999);
+	}
+
+	public function init()
+	{
+		if (!class_exists('WooCommerce') || !function_exists('wc_authorize_net_cim')) {
+			return;
+		}
+
+		add_action('wp_enqueue_scripts', array($this, 'enqueue_scripts'), 999);
+		add_action('woocommerce_proceed_to_checkout', array($this, 'render_button'), 1);
+		add_action('woocommerce_checkout_before_customer_details', array($this, 'render_button'), 1);
+		add_action('cfw_payment_request_buttons', array($this, 'render_checkoutwc_button'), 1);
+		add_filter('cfw_detected_gateways', array($this, 'register_checkoutwc_gateway'), 10);
+		add_shortcode('apple_pay_button', array($this, 'shortcode'));
+
+		// Custom AJAX handlers for WooCommerce integration
+		add_action('wp_ajax_authnet_apple_pay_get_shipping', array($this, 'ajax_get_shipping'));
+		add_action('wp_ajax_nopriv_authnet_apple_pay_get_shipping', array($this, 'ajax_get_shipping'));
+		add_action('wp_ajax_authnet_apple_pay_update_shipping', array($this, 'ajax_update_shipping'));
+		add_action('wp_ajax_nopriv_authnet_apple_pay_update_shipping', array($this, 'ajax_update_shipping'));
+	}
+
+	/**
+	 * Get shipping methods for address
+	 */
+	public function ajax_get_shipping()
+	{
+		check_ajax_referer('apple-pay-shipping', 'nonce');
+
+		$address = json_decode(stripslashes($_POST['address']), true);
+
+		// Log for debugging
+		error_log('Apple Pay Shipping Request: ' . print_r($address, true));
+
+		// Validate address data
+		if (empty($address) || !isset($address['countryCode'])) {
+			error_log('Apple Pay: Invalid address data received');
+			wp_send_json_error(array(
+				'message' => 'Invalid address data',
+				'errors' => array(
+					array(
+						'code' => 'shippingContactInvalid',
+						'contactField' => 'postalAddress',
+						'message' => 'Please provide a valid shipping address'
+					)
+				)
+			));
+			return;
+		}
+
+		// Set customer address in session
+		WC()->customer->set_shipping_country($address['countryCode']);
+		WC()->customer->set_shipping_state(isset($address['administrativeArea']) ? $address['administrativeArea'] : '');
+		WC()->customer->set_shipping_postcode(isset($address['postalCode']) ? $address['postalCode'] : '');
+		WC()->customer->set_shipping_city(isset($address['locality']) ? $address['locality'] : '');
+
+		// Check if cart needs shipping
+		if (!WC()->cart->needs_shipping()) {
+			error_log('Apple Pay: Cart does not need shipping');
+			wp_send_json_success(array(
+				'shippingMethods' => array(),
+				'total' => array(
+					'label' => get_bloginfo('name'),
+					'amount' => number_format(WC()->cart->get_total('raw'), 2, '.', ''),
+					'type' => 'final'
+				),
+				'lineItems' => $this->build_line_items(0)
+			));
+			return;
+		}
+
+		// Calculate shipping
+		WC()->cart->calculate_shipping();
+		WC()->cart->calculate_totals();
+
+		$packages = WC()->shipping()->get_packages();
+		$shipping_methods = array();
+
+		if (!empty($packages) && !empty($packages[0]['rates'])) {
+			foreach ($packages[0]['rates'] as $rate) {
+				$shipping_methods[] = array(
+					'label' => $rate->get_label(),
+					'amount' => number_format($rate->get_cost(), 2, '.', ''),
+					'detail' => '',
+					'identifier' => $rate->get_id()
+				);
+			}
+		}
+
+		// Log shipping methods found
+		error_log('Apple Pay: Found ' . count($shipping_methods) . ' shipping methods');
+
+		// Handle no shipping methods available
+		if (empty($shipping_methods)) {
+			error_log('Apple Pay: No shipping methods available for address');
+			wp_send_json_error(array(
+				'message' => 'No shipping methods available',
+				'errors' => array(
+					array(
+						'code' => 'shippingContactInvalid',
+						'contactField' => 'postalAddress',
+						'message' => 'Shipping is not available to this address'
+					)
+				)
+			));
+			return;
+		}
+
+		// Get shipping cost for first method (default selection)
+		$shipping_cost = floatval($shipping_methods[0]['amount']);
+
+		wp_send_json_success(array(
+			'shippingMethods' => $shipping_methods,
+			'total' => array(
+				'label' => get_bloginfo('name'),
+				'amount' => number_format(WC()->cart->get_total('raw'), 2, '.', ''),
+				'type' => 'final'
+			),
+			'lineItems' => $this->build_line_items($shipping_cost)
+		));
+	}
+
+	/**
+	 * Build line items for Apple Pay
+	 */
+	private function build_line_items($shipping_cost = 0)
+	{
+		$line_items = array();
+
+		// Add cart items
+		foreach (WC()->cart->get_cart() as $cart_item) {
+			$product = $cart_item['data'];
+			$line_items[] = array(
+				'label' => $product->get_name() . ' x ' . $cart_item['quantity'],
+				'amount' => number_format($cart_item['line_total'], 2, '.', ''),
+				'type' => 'final'
+			);
+		}
+
+		// Add shipping if applicable
+		if ($shipping_cost > 0) {
+			$line_items[] = array(
+				'label' => 'Shipping',
+				'amount' => number_format($shipping_cost, 2, '.', ''),
+				'type' => 'final'
+			);
+		}
+
+		// Add tax
+		if (WC()->cart->get_taxes_total() > 0) {
+			$line_items[] = array(
+				'label' => 'Tax',
+				'amount' => number_format(WC()->cart->get_taxes_total(), 2, '.', ''),
+				'type' => 'final'
+			);
+		}
+
+		return $line_items;
+	}
+
+	/**
+	 * Update shipping method
+	 */
+	public function ajax_update_shipping()
+	{
+		check_ajax_referer('apple-pay-shipping', 'nonce');
+
+		$method_id = sanitize_text_field($_POST['method_id']);
+
+		// Set chosen shipping method
+		$chosen_methods = array($method_id);
+		WC()->session->set('chosen_shipping_methods', $chosen_methods);
+
+		// Recalculate
+		WC()->cart->calculate_shipping();
+		WC()->cart->calculate_totals();
+
+		// Get the selected shipping cost
+		$shipping_cost = floatval(WC()->cart->get_shipping_total());
+
+		wp_send_json_success(array(
+			'total' => array(
+				'label' => get_bloginfo('name'),
+				'amount' => number_format(WC()->cart->get_total('raw'), 2, '.', ''),
+				'type' => 'final'
+			),
+			'lineItems' => $this->build_line_items($shipping_cost)
+		));
+	}
+
+	public function register_checkoutwc_gateway($gateways)
+	{
+		if (!class_exists('Objectiv\Plugins\Checkout\Model\DetectedPaymentGateway')) {
+			return $gateways;
+		}
+
+		$gateways[] = new \Objectiv\Plugins\Checkout\Model\DetectedPaymentGateway(
+			'WooCommerce Authorize.Net Gateway',
+			\Objectiv\Plugins\Checkout\Model\GatewaySupport::FULLY_SUPPORTED
+		);
+
+		return $gateways;
+	}
+
+	public function enqueue_scripts()
+	{
+		$is_checkoutwc = function_exists('is_cfw') && is_cfw();
+
+		if (!is_cart() && !is_checkout() && !$is_checkoutwc) {
+			return;
+		}
+
+		wp_enqueue_script(
+			'apple-pay-sdk',
+			'https://applepay.cdn-apple.com/jsapi/1.latest/apple-pay-sdk.js',
+			array(),
+			null,
+			false
+		);
+
+		$authnet_plugin_file = WP_PLUGIN_DIR . '/woocommerce-gateway-authorize-net-cim/woocommerce-gateway-authorize-net-cim.php';
+
+		if (!file_exists($authnet_plugin_file)) {
+			return;
+		}
+
+		$plugin_url = plugins_url('', $authnet_plugin_file);
+
+		wp_enqueue_script(
+			'sv-wc-apple-pay',
+			$plugin_url . '/vendor/skyverge/wc-plugin-framework/woocommerce/payment-gateway/assets/dist/frontend/sv-wc-payment-gateway-apple-pay.js',
+			array('jquery', 'apple-pay-sdk'),
+			'5.15.12',
+			true
+		);
+
+		$gateway_script = $plugin_url . '/assets/js/frontend/wc-authorize-net-apple-pay.min.js';
+
+		if (!file_exists(str_replace(plugins_url(), WP_PLUGIN_DIR, $gateway_script))) {
+			$gateway_script = $plugin_url . '/assets/js/frontend/wc-authorize-net-apple-pay.js';
+		}
+
+		wp_enqueue_script(
+			'wc-authnet-apple-pay',
+			$gateway_script,
+			array('sv-wc-apple-pay'),
+			'3.10.13',
+			true
+		);
+
+		wp_enqueue_style(
+			'sv-wc-apple-pay-css',
+			$plugin_url . '/vendor/skyverge/wc-plugin-framework/woocommerce/payment-gateway/assets/css/frontend/sv-wc-payment-gateway-apple-pay.css',
+			array(),
+			'5.15.12'
+		);
+
+		$this->localize_script();
+	}
+
+	private function localize_script()
+	{
+		$gateways = WC()->payment_gateways()->get_available_payment_gateways();
+
+		if (!isset($gateways['authorize_net_cim_credit_card'])) {
+			return;
+		}
+
+		$gateway = $gateways['authorize_net_cim_credit_card'];
+		$plugin = $gateway->get_plugin();
+		$apple_pay = $plugin->get_apple_pay_instance();
+
+		if (!$apple_pay) {
+			return;
+		}
+
+		// Build simple payment request
+		$line_items = array();
+		foreach (WC()->cart->get_cart() as $cart_item) {
+			$product = $cart_item['data'];
+			$line_items[] = array(
+				'label' => $product->get_name() . ' x ' . $cart_item['quantity'],
+				'amount' => number_format($cart_item['line_total'], 2, '.', ''),
+				'type' => 'final'
+			);
+		}
+
+		$payment_request = array(
+			'countryCode' => WC()->countries->get_base_country(),
+			'currencyCode' => get_woocommerce_currency(),
+			'merchantCapabilities' => array('supports3DS'),
+			'supportedNetworks' => array('visa', 'masterCard', 'amex', 'discover'),
+			'total' => array(
+				'label' => get_bloginfo('name'),
+				'amount' => number_format(WC()->cart->get_total('raw'), 2, '.', ''),
+				'type' => 'final'
+			),
+			'lineItems' => $line_items,
+			'requiredShippingContactFields' => array('postalAddress'),
+			'requiredBillingContactFields' => array('postalAddress', 'name', 'email', 'phone')
+		);
+
+		$params = array(
+			'gateway_id' => 'authorize_net_cim_credit_card',
+			'merchant_id' => $apple_pay->get_merchant_id(),
+			'ajax_url' => admin_url('admin-ajax.php'),
+			'validate_nonce' => wp_create_nonce('wc_authorize_net_cim_credit_card_apple_pay_validate_merchant'),
+			'process_nonce' => wp_create_nonce('wc_authorize_net_cim_credit_card_apple_pay_process_payment'),
+			'shipping_nonce' => wp_create_nonce('apple-pay-shipping'),
+			'payment_request' => $payment_request,
+			'generic_error' => 'An error occurred, please try again',
+		);
+
+		wp_localize_script(
+			'sv-wc-apple-pay',
+			'sv_wc_authorize_net_cim_credit_card_apple_pay_handler_params',
+			$params
+		);
+	}
+
+	public function render_button()
+	{
+		static $rendered = false;
+		if ($rendered) {
+			return;
+		}
+		$rendered = true;
+
+		?>
+		<div class="sv-wc-external-checkout authnet-apple-pay-wrapper">
+			<div class="buttons-container">
+				<apple-pay-button buttonstyle="black" type="buy" locale="<?php echo esc_attr(substr(get_locale(), 0, 2)); ?>"
+					id="apple-pay-button-cart" class="apple-pay-button-universal">
+				</apple-pay-button>
+			</div>
+		</div>
+
+		<style>
+			.authnet-apple-pay-wrapper {
+				margin: 20px 0;
+				text-align: center;
+			}
+
+			.authnet-apple-pay-wrapper .buttons-container {
+				display: flex;
+				justify-content: center;
+			}
+
+			apple-pay-button.apple-pay-button-universal {
+				--apple-pay-button-width: 200px;
+				--apple-pay-button-height: 48px;
+				--apple-pay-button-border-radius: 5px;
+				--apple-pay-button-padding: 0px 0px;
+				--apple-pay-button-box-sizing: border-box;
+				cursor: pointer;
+			}
+
+			apple-pay-button.apple-pay-button-universal:hover {
+				opacity: 0.85;
+			}
+		</style>
+
+		<?php
+		$this->render_init_script();
+	}
+
+	public function render_checkoutwc_button()
+	{
+		static $rendered = false;
+		if ($rendered) {
+			return;
+		}
+		$rendered = true;
+
+		?>
+		<div class="sv-wc-external-checkout cfw-apple-pay-button-wrapper">
+			<div class="buttons-container">
+				<apple-pay-button buttonstyle="black" type="buy" locale="<?php echo esc_attr(substr(get_locale(), 0, 2)); ?>"
+					id="apple-pay-button-checkoutwc" class="apple-pay-button-checkoutwc">
+				</apple-pay-button>
+			</div>
+		</div>
+
+		<style>
+			.cfw-apple-pay-button-wrapper {
+				width: 100%;
+				margin-bottom: 0;
+			}
+
+			.cfw-apple-pay-button-wrapper .buttons-container {
+				display: flex;
+				justify-content: center;
+				width: 100%;
+			}
+
+			apple-pay-button.apple-pay-button-checkoutwc {
+				--apple-pay-button-width: 200px;
+				--apple-pay-button-height: 48px;
+				--apple-pay-button-border-radius: 5px;
+				--apple-pay-button-padding: 0px 0px;
+				--apple-pay-button-box-sizing: border-box;
+				cursor: pointer;
+			}
+
+			apple-pay-button.apple-pay-button-checkoutwc:hover {
+				opacity: 0.85;
+			}
+		</style>
+
+		<?php
+		$this->render_init_script(true);
+	}
+
+	private function render_init_script($is_checkoutwc = false)
+	{
+		$button_id = $is_checkoutwc ? 'apple-pay-button-checkoutwc' : 'apple-pay-button-cart';
+		?>
+		<script>
+			(function () {
+				if (!window.ApplePaySession || !ApplePaySession.canMakePayments()) {
+					return;
+				}
+
+				document.getElementById('<?php echo $button_id; ?>').addEventListener('click', function (e) {
+					e.preventDefault();
+
+					var params = window.sv_wc_authorize_net_cim_credit_card_apple_pay_handler_params;
+
+					if (!params || !params.payment_request) {
+						console.error('Payment request not found');
+						return;
+					}
+
+					var session = new ApplePaySession(3, params.payment_request);
+
+					session.onvalidatemerchant = function (event) {
+						fetch(params.ajax_url, {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+							body: new URLSearchParams({
+								action: 'wc_' + params.gateway_id + '_apple_pay_validate_merchant',
+								nonce: params.validate_nonce,
+								merchant_id: params.merchant_id,
+								url: event.validationURL
+							})
+						})
+							.then(res => res.json())
+							.then(data => {
+								if (data.success) {
+									session.completeMerchantValidation(JSON.parse(data.data));
+								} else {
+									session.abort();
+								}
+							})
+							.catch(() => session.abort());
+					};
+
+					session.onpaymentmethodselected = function (event) {
+						session.completePaymentMethodSelection(
+							params.payment_request.total,
+							params.payment_request.lineItems
+						);
+					};
+
+					session.onshippingcontactselected = function (event) {
+						console.log('Apple Pay: Shipping contact selected', event.shippingContact);
+
+						fetch(params.ajax_url, {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+							body: new URLSearchParams({
+								action: 'authnet_apple_pay_get_shipping',
+								nonce: params.shipping_nonce,
+								address: JSON.stringify(event.shippingContact)
+							})
+						})
+							.then(res => res.json())
+							.then(data => {
+								console.log('Apple Pay: Shipping response', data);
+
+								if (data.success && data.data.shippingMethods && data.data.shippingMethods.length > 0) {
+									// Success - shipping methods available
+									session.completeShippingContactSelection({
+										newShippingMethods: data.data.shippingMethods,
+										newTotal: data.data.total,
+										newLineItems: data.data.lineItems
+									});
+								} else if (!data.success && data.data && data.data.errors) {
+									// Server returned Apple Pay errors
+									console.error('Apple Pay: Shipping errors', data.data.errors);
+
+									var errors = data.data.errors.map(function (err) {
+										return new ApplePayError(
+											err.code || 'shippingContactInvalid',
+											err.contactField || 'postalAddress',
+											err.message || 'Shipping is not available to this address'
+										);
+									});
+
+									session.completeShippingContactSelection({
+										errors: errors,
+										newShippingMethods: [],
+										newTotal: params.payment_request.total,
+										newLineItems: params.payment_request.lineItems
+									});
+								} else {
+									// Unexpected error format
+									console.error('Apple Pay: Unexpected response format', data);
+
+									var genericError = new ApplePayError(
+										'shippingContactInvalid',
+										'postalAddress',
+										'Unable to calculate shipping for this address'
+									);
+
+									session.completeShippingContactSelection({
+										errors: [genericError],
+										newShippingMethods: [],
+										newTotal: params.payment_request.total,
+										newLineItems: params.payment_request.lineItems
+									});
+								}
+							})
+							.catch(error => {
+								console.error('Apple Pay: Network error', error);
+
+								var networkError = new ApplePayError(
+									'shippingContactInvalid',
+									'postalAddress',
+									'Unable to connect to server'
+								);
+
+								session.completeShippingContactSelection({
+									errors: [networkError],
+									newShippingMethods: [],
+									newTotal: params.payment_request.total,
+									newLineItems: params.payment_request.lineItems
+								});
+							});
+					};
+
+					session.onshippingmethodselected = function (event) {
+						fetch(params.ajax_url, {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+							body: new URLSearchParams({
+								action: 'authnet_apple_pay_update_shipping',
+								nonce: params.shipping_nonce,
+								method_id: event.shippingMethod.identifier
+							})
+						})
+							.then(res => res.json())
+							.then(data => {
+								if (data.success) {
+									session.completeShippingMethodSelection(
+										data.data.total,
+										data.data.lineItems
+									);
+								} else {
+									session.completeShippingMethodSelection(
+										params.payment_request.total,
+										params.payment_request.lineItems
+									);
+								}
+							})
+							.catch(() => {
+								session.completeShippingMethodSelection(
+									params.payment_request.total,
+									params.payment_request.lineItems
+								);
+							});
+					};
+
+					session.onpaymentauthorized = function (event) {
+						fetch(params.ajax_url, {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+							body: new URLSearchParams({
+								action: 'wc_' + params.gateway_id + '_apple_pay_process_payment',
+								nonce: params.process_nonce,
+								payment: JSON.stringify(event.payment)
+							})
+						})
+							.then(res => res.json())
+							.then(data => {
+								if (data.success) {
+									session.completePayment(ApplePaySession.STATUS_SUCCESS);
+									setTimeout(() => window.location = data.data.redirect, 500);
+								} else {
+									session.completePayment(ApplePaySession.STATUS_FAILURE);
+									alert(params.generic_error);
+								}
+							})
+							.catch(() => {
+								session.completePayment(ApplePaySession.STATUS_FAILURE);
+								alert(params.generic_error);
+							});
+					};
+
+					session.oncancel = function () {
+						console.log('Payment canceled');
+					};
+
+					session.begin();
+				});
+			})();
+		</script>
+		<?php
+	}
+
+	public function shortcode($atts)
+	{
+		ob_start();
+		$this->render_button();
+		return ob_get_clean();
+	}
+}
+
+new AuthNet_Apple_Pay_Universal();
