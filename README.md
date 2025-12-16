@@ -201,7 +201,7 @@ This plugin is provided as-is without warranty. Use at your own risk.
 
 ## Credits
 
-**Author**: Colors Products  
+**Author**: Brian Paknoosh
 **Built for**: WooCommerce + Authorize.Net Gateway integration  
 **Apple Pay**: Apple Inc.  
 **Payment Gateway Framework**: SkyVerge
